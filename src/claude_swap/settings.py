@@ -47,9 +47,18 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    # "best" (most headroom), "consume-first" (soonest weekly reset), or
+    # "priority" (a preferred account first, see `priority_order`).
+    strategy: str = "best"
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
+    # Comma-separated account numbers, highest priority first (e.g. "2,1"),
+    # for the "priority" strategy. Accounts left out rank after every listed
+    # one, among themselves in sequence order. None/empty = plain sequence
+    # order. Only the account NUMBERS are validated here (positive integers);
+    # numbers that match no account are simply ignored when the engine ranks,
+    # the same way model names are only checked against live usage.
+    priority_order: str | None = None
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
     # per-model weekly limit is folded into the binding window, so the engine
@@ -82,7 +91,7 @@ class SettingSpec:
     section: str  # top-level JSON section ("autoswitch", "ui")
     json_key: str  # camelCase key inside the section
     field: str  # snake_case AutoSwitchSettings field
-    kind: str  # "float" | "int" | "bool" | "choice"
+    kind: str  # "float" | "int" | "bool" | "choice" | "string"
     lo: float | None = None
     hi: float | None = None
     choices: tuple[str, ...] = ()
@@ -120,8 +129,12 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "priority"),
             help="How auto-switch picks the target account",
+        ),
+        SettingSpec(
+            "autoswitch", "priorityOrder", "priority_order", "string",
+            help="Account numbers, best first (e.g. 2,1), for strategy=priority",
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
@@ -165,6 +178,27 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
         if name and name.lower() not in seen:
             seen[name.lower()] = name
     return tuple(seen.values())
+
+
+def parse_priority_order(value: str | None) -> tuple[str, ...]:
+    """Split ``autoswitch.priorityOrder`` into account numbers, best first.
+
+    Same shape as :func:`parse_model_names` — split on commas, trim, drop
+    empties, dedupe with the first mention winning — so the two settings read
+    identically. Deliberately returns STRINGS: account numbers are keyed as
+    strings everywhere the engine ranks (``switchable_account_numbers``,
+    ``headroom``), and converting here would only invite an int/str mismatch
+    at the comparison. Numbers that match no account cost nothing: they simply
+    never match a candidate.
+    """
+    if not value:
+        return ()
+    seen: dict[str, None] = {}
+    for part in value.split(","):
+        num = part.strip()
+        if num:
+            seen.setdefault(num, None)
+    return tuple(seen)
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
@@ -308,6 +342,20 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
                 f"{spec.dotted} expects a non-empty value; use "
                 f"'cswap config unset {spec.dotted}' to clear it"
             )
+        if spec.field == "priority_order":
+            # SHAPE only, never membership. A non-numeric entry is a typo the
+            # user should hear about now; an entry that is a perfectly good
+            # number but matches no account is NOT an error — this module has
+            # no switcher to ask, accounts are added and removed after the
+            # setting is written, and the engine already ignores unknown
+            # numbers. Same split as `autoswitch.model`, whose names are
+            # likewise only checked against live data.
+            for part in parse_priority_order(value):
+                if not part.isdigit() or int(part) <= 0:
+                    raise ConfigError(
+                        f"{spec.dotted} expects comma-separated account "
+                        f"numbers (e.g. '2,1'), got '{part}'"
+                    )
         return value
     try:
         value = int(raw_value) if spec.kind == "int" else float(raw_value)

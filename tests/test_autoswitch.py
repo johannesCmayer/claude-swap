@@ -3358,6 +3358,379 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         )
 
 
+# --- priority strategy ---------------------------------------------------------
+
+
+class TestPriorityStrategy:
+    """`priority` burns the accounts named in `autoswitch.priorityOrder` first
+    and RETURNS to them as soon as they are comfortably healthy again.
+
+    The motivating fleet is asymmetric: one big subscription and one small
+    one. The small account's 5-hour quota is use-it-or-lose-it, so `best` —
+    which takes no action at all below the threshold — parks on the big
+    account and silently throws the small one's window away every five hours.
+    Here the preferred accounts are the ones spent, and the unlisted ones are
+    the reserve.
+    """
+
+    def _harness(
+        self, temp_home: Path, order: str | None = "2,1", **kwargs
+    ) -> EngineHarness:
+        h = EngineHarness(
+            temp_home, strategy="priority", priority_order=order, **kwargs
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    # -- below the threshold: the proactive return ---------------------------
+
+    def test_below_threshold_returns_to_the_higher_priority_account(
+        self, temp_home
+    ):
+        # The whole point of the strategy: nothing is wrong with account 1,
+        # but account 2 is preferred and has room, so go spend it.
+        h = self._harness(temp_home)          # order 2,1 -> 3 unlisted, last
+        outcome = h.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(10),
+            "3": _usage(10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "priority"
+        assert sw.to_ref == {"number": 2, "email": "b@example.com"}
+
+    def test_stays_when_already_on_the_top_priority_account(self, temp_home):
+        # Active account 1 is ranked first, so no candidate is STRICTLY
+        # higher-priority — holding is the right answer, and it is NO_ACTION
+        # rather than a block (the exit-code contract cron wrappers key on).
+        h = self._harness(temp_home, order="1,2")
+        outcome = h.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(0),
+            "3": _usage(0),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-on-priority"]
+
+    def test_a_merely_healthy_target_is_not_comfortable_enough(self, temp_home):
+        """The below-threshold return needs a full hysteresis margin INSIDE
+        the threshold, not just "under it".
+
+        At the defaults (threshold 90, hysteresis 10) that is 20 points of
+        headroom. An 85%-used preferred account passes the ordinary
+        landing-health gate — it is below 90 — and switching there would
+        re-trigger a proactive move within a few points of burn, which is the
+        ping-pong the hysteresis margin exists to prevent. 80% is the exact
+        boundary and must be taken.
+        """
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(85),                  # healthy, but not comfortably
+            "3": _usage(10),
+        }) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "already-on-priority"
+        ]
+
+        h.events.clear()
+        h.clock.advance(60.0)
+        assert h.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(80),                  # exactly threshold - hysteresis
+            "3": _usage(10),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_spent_preferred_account_is_taken_once_it_resets(self, temp_home):
+        # Over its own threshold the preferred account is not a landing spot
+        # at all; when its window rolls over, the return fires on a later tick
+        # with no other input changing.
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(95),                  # preferred, but spent
+            "3": _usage(10),
+        }) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "already-on-priority"
+        ]
+
+        h.events.clear()
+        h.clock.advance(60.0)
+        assert h.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(0),                   # 5-hour window rolled over
+            "3": _usage(10),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert next(
+            e for e in h.events if isinstance(e, SwitchEvent)
+        ).trigger == "priority"
+
+    # -- at/over the threshold ------------------------------------------------
+
+    def test_over_threshold_prefers_priority_over_max_headroom(self, temp_home):
+        # Active must move. #3 has far more headroom, #2 is preferred and
+        # perfectly healthy -> #2. (`best` would take #3.)
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(95),
+            "2": _usage(60),                  # ranked first, 40 pts
+            "3": _usage(5),                   # unlisted, 95 pts
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert next(
+            e for e in h.events if isinstance(e, SwitchEvent)
+        ).trigger == "proactive"
+
+    def test_at_limit_escape_uses_the_same_priority_ranking(self, temp_home):
+        # The escape skips the anti-flap gates but not the ordering: once the
+        # user has said which account they would rather be on, an escape
+        # should land there too when it is healthy.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(100),
+            "2": _usage(60),
+            "3": _usage(5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert next(
+            e for e in h.events if isinstance(e, SwitchEvent)
+        ).trigger == "at-limit"
+
+    # -- the ranking itself ---------------------------------------------------
+
+    def test_unset_priority_order_is_plain_sequence_order(self, temp_home):
+        # No declared order: the lowest account number is preferred. Active 1
+        # is therefore already top-ranked below the threshold...
+        h = self._harness(temp_home, order=None)
+        assert h.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(0),
+            "3": _usage(0),
+        }) is TickOutcome.NO_ACTION
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "already-on-priority"
+        ]
+        # ...and over the threshold the ranking is still sequence order, so #2
+        # wins over a #3 holding nearly twice the headroom.
+        h.events.clear()
+        h.clock.advance(60.0)
+        assert h.tick_with_usage({
+            "1": _usage(95),
+            "2": _usage(50),
+            "3": _usage(10),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_unlisted_accounts_rank_after_every_listed_one(self, temp_home):
+        # Only #3 is named. It has the LEAST headroom of the candidates and
+        # the highest slot number, and must still win both ways it could lose.
+        h = self._harness(temp_home, order="3")
+        outcome = h.tick_with_usage({
+            "1": _usage(95),
+            "2": _usage(10),                  # unlisted, 90 pts
+            "3": _usage(50),                  # listed, 50 pts
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_priority_rank_orders_listed_then_unlisted_then_unnumbered(self):
+        from claude_swap.autoswitch import priority_rank
+
+        order = ("2", "1")
+        assert priority_rank("2", order) < priority_rank("1", order)
+        assert priority_rank("1", order) < priority_rank("3", order)
+        assert priority_rank("3", order) < priority_rank("10", order)
+        assert priority_rank("10", ()) < priority_rank("x", ())
+        # An int slot must not silently fall out of the listed tier.
+        assert priority_rank(2, order) == priority_rank("2", order)
+        # The listed/unlisted TIER decides before either inner value does.
+        # Without it, a listed account's position and an unlisted account's
+        # number are compared as if they were the same quantity — measured on
+        # `("5", "4", "3")`, the third-choice account 3 (position 2) ties with
+        # unlisted account 2, and account 1 beats it outright.
+        deep = ("5", "4", "3")
+        assert priority_rank("3", deep) < priority_rank("1", deep)
+        assert priority_rank("3", deep) < priority_rank("2", deep)
+
+    # -- anti-flap ------------------------------------------------------------
+
+    def test_respects_cooldown_then_returns_once_it_expires(self, temp_home):
+        # Only #1 is preferred. The active account burns past the threshold and
+        # lands on #2; the very next tick #1 is fully reset and outranks #2,
+        # but the cooldown must hold the move until it expires.
+        h = self._harness(temp_home, order="1")   # default cooldown 300s
+        assert h.tick_with_usage({
+            "1": _usage(95),
+            "2": _usage(10),
+            "3": _usage(50),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        h.events.clear()
+        spent_then_fresh = {"1": _usage(0), "2": _usage(20), "3": _usage(50)}
+        assert h.tick_with_usage(spent_then_fresh) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "cooldown"
+        ]
+
+        h.events.clear()
+        h.clock.advance(301.0)
+        assert h.tick_with_usage(spent_then_fresh) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert next(
+            e for e in h.events if isinstance(e, SwitchEvent)
+        ).trigger == "priority"
+
+    def test_does_not_flap_back_onto_the_account_it_just_left(self, temp_home):
+        """A `priority` tick must not undo the proactive move that just fired.
+
+        Two accounts, #1 preferred. The engine leaves #1 at the threshold and
+        lands on #2. #1 is now BOTH the highest-priority account and the one
+        we just left — exactly the pair the no-return bar and the comfort gate
+        both exist for — and every tick while it stays spent must hold. Once
+        its window actually rolls over, the return fires: the bar's release
+        asks whether the account improved since departure, and a reset from 8
+        points to 100 is the clearest yes there is.
+        """
+        h = EngineHarness(temp_home, strategy="priority", priority_order="1")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage(92),
+            "2": _usage(10),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.engine._read_state()["lastSwitchFrom"] == 1
+
+        outcomes = []
+        for _ in range(5):
+            h.clock.advance(301.0)
+            outcomes.append(h.tick_with_usage({
+                "1": _usage(92),              # still spent, frozen
+                "2": _usage(20),
+            }))
+        assert all(o is TickOutcome.NO_ACTION for o in outcomes), (
+            f"{[o.name for o in outcomes]} — the engine flapped back onto the "
+            "account it had just left while that account was still spent"
+        )
+        assert h.active_number() == 2
+
+        h.clock.advance(301.0)
+        assert h.tick_with_usage({
+            "1": _usage(0),                   # window rolled over
+            "2": _usage(20),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_the_no_return_bar_is_scoped_to_the_priority_trigger(self, harness):
+        """Directly: `priority` must be inside `_no_return_account`'s trigger
+        tuple (a proactive move it can undo), and the escapes outside it.
+
+        The end-to-end test above cannot separate the bar from the comfort
+        gate — both refuse the same tick — so the scoping is pinned here.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        state = {"lastSwitchFrom": "1", "lastSwitchTo": "2", "leftHeadroom": 8.0}
+        settings = AutoSwitchSettings(strategy="priority", priority_order="1")
+        args = ({"1": 8.0, "2": 80.0}, 80.0, False, settings, "2")
+        assert harness.engine._no_return_account("priority", state, *args) == "1"
+        assert harness.engine._no_return_account("at-limit", state, *args) is None
+        assert harness.engine._no_return_account("failover", state, *args) is None
+
+    # -- two-phase commit -----------------------------------------------------
+
+    def test_two_phase_refetch_disqualifies_a_stale_priority_pick(self, temp_home):
+        """`priority` decides below the threshold, outside the collector's
+        escalation band, so its provisional pick can ride a stale snapshot —
+        the same hazard consume-first's two-phase commit exists for. The
+        stored rows say the preferred account has room; the escalated refetch
+        says it burned out. The tick must re-decide on the fresh data.
+        """
+        h = self._harness(temp_home)
+        stored = {"1": _usage(20), "2": _usage(10), "3": _usage(10)}
+        fresh = {"1": _usage(20), "2": _usage(95), "3": _usage(10)}
+        fetch_sets: list[set] = []
+
+        def collect(fetch=None, **_kwargs):
+            requested = set(fetch or ())
+            fetch_sets.append(requested)
+            view = fresh if requested == {"1", "2", "3"} else stored
+            return {
+                num: _entry_for(value, h.clock.now) for num, value in view.items()
+            }
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=collect
+        ):
+            outcome = h.engine.tick()
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert fetch_sets.count({"1", "2", "3"}) == 1  # phase 2 fired once
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "already-on-priority"
+        ]
+
+    # -- departure bookkeeping ------------------------------------------------
+
+    def test_departure_records_the_priority_trigger(self, temp_home):
+        """`leftTrigger` is what `_left_account_recovered` reads to pick which
+        release legs apply, so a `priority` departure must record itself and
+        not fall through the pre-upgrade "both nulls means failover"
+        inference."""
+        h = self._harness(temp_home)
+        assert h.tick_with_usage({
+            "1": _usage(20),
+            "2": _usage(10),
+            "3": _usage(10),
+        }) is TickOutcome.SWITCHED
+        state = h.engine._read_state()
+        assert state["leftTrigger"] == "priority"
+        assert state["lastSwitchFrom"] == 1
+        assert state["lastSwitchTo"] == "2"
+
+    # -- other strategies are untouched ---------------------------------------
+
+    def test_best_still_ignores_priority_order(self, temp_home):
+        # `priorityOrder` set but strategy left at the default: `best` must
+        # still hold below the threshold and still pick on headroom above it.
+        h = EngineHarness(temp_home, priority_order="2,1")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_usage({
+            "1": _usage(20), "2": _usage(0), "3": _usage(0),
+        }) is TickOutcome.NO_ACTION
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "below-threshold"
+        ]
+        h.events.clear()
+        h.clock.advance(60.0)
+        assert h.tick_with_usage({
+            "1": _usage(95), "2": _usage(60), "3": _usage(5),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 3      # most headroom, not most preferred
+
+
 class TestEveryAccountAboveThreshold:
     """With nothing below the threshold, go to whatever comes back soonest.
 
@@ -4630,7 +5003,7 @@ class TestHorizonAxisDoesNotFlap:
 
         args = dict(
             trigger="proactive",
-            consume_first=False,
+            strategy="best",
             oauth_candidates=["1", "3"],
             usage={"1": _usage(40), "2": _usage(96), "3": _usage(99)},
             headroom={"1": 60.0, "2": 4.0, "3": 1.0},

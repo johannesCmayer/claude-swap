@@ -948,6 +948,26 @@ class TestAutoCommand:
         self._run(["--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True
 
+    def test_strategy_priority_is_accepted_and_forwarded(self, temp_home):
+        self._run(["--once", "--strategy", "priority"], temp_home)
+        assert self.FakeEngine.instances[-1].settings.strategy == "priority"
+
+    def test_priority_order_comes_from_settings_json_only(self, temp_home):
+        # No CLI flag for it (it is a fleet-shaped preference, not a per-run
+        # knob); the engine must still see the configured value.
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"strategy": "priority", "priorityOrder": "2,1"},
+        }))
+        self._run(["--once"], temp_home)
+        engine = self.FakeEngine.instances[-1]
+        assert engine.settings.strategy == "priority"
+        assert engine.settings.priority_order == "2,1"
+
     def test_json_stdout_is_pure_jsonl(self, temp_home, capsys):
         from claude_swap.autoswitch import NoSwitchEvent, TickOutcome
 

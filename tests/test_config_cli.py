@@ -45,13 +45,14 @@ class TestConfigList:
             "autoswitch.cooldownSeconds",
             "autoswitch.hysteresisPct",
             "autoswitch.strategy",
+            "autoswitch.priorityOrder",
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        assert out.count("(default)") == 10
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -78,7 +79,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        assert len(by_key) == 10
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
@@ -175,6 +176,26 @@ class TestConfigValidation:
         code, _, err = _run(["set", "autoswitch.strategy", "chaos"], capsys)
         assert code == 1
         assert "must be one of: best" in err
+        assert "priority" in err
+
+    def test_set_strategy_priority(self, temp_home, capsys):
+        code, _, _ = _run(["set", "autoswitch.strategy", "priority"], capsys)
+        assert code == 0
+        code, out, _ = _run(["get", "autoswitch.strategy"], capsys)
+        assert code == 0
+        assert "priority" in out
+
+    def test_set_and_get_priority_order(self, temp_home, capsys):
+        code, _, _ = _run(["set", "autoswitch.priorityOrder", "2,1"], capsys)
+        assert code == 0
+        code, out, _ = _run(["get", "autoswitch.priorityOrder"], capsys)
+        assert code == 0
+        assert "2,1" in out
+
+    def test_bad_priority_order_exits_1(self, temp_home, capsys):
+        code, _, err = _run(["set", "autoswitch.priorityOrder", "2,work"], capsys)
+        assert code == 1
+        assert "account numbers" in err
 
     def test_unknown_key_json_error_envelope(self, temp_home, capsys):
         code, out, _ = _run(["--json", "get", "autoswitch.bogus"], capsys)

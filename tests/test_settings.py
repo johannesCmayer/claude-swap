@@ -20,6 +20,7 @@ from claude_swap.settings import (
     load_settings,
     load_ui_settings,
     merged_with_cli,
+    parse_priority_order,
     save_settings,
     set_setting,
     settings_path,
@@ -97,6 +98,58 @@ class TestLoadSettings:
     def test_set_strategy_consume_first(self, tmp_path: Path):
         set_setting(tmp_path, "autoswitch.strategy", "consume-first")
         assert load_settings(tmp_path).strategy == "consume-first"
+
+    def test_priority_is_a_valid_strategy(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"strategy": "priority"}})
+        )
+        assert load_settings(tmp_path).strategy == "priority"
+
+    def test_set_strategy_priority(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "priority")
+        assert load_settings(tmp_path).strategy == "priority"
+
+
+class TestPriorityOrder:
+    def test_defaults_to_none(self, tmp_path: Path):
+        assert load_settings(tmp_path).priority_order is None
+
+    def test_set_get_roundtrip(self, tmp_path: Path):
+        assert set_setting(tmp_path, "autoswitch.priorityOrder", "2,1") == "2,1"
+        assert load_settings(tmp_path).priority_order == "2,1"
+        assert unset_setting(tmp_path, "autoswitch.priorityOrder") is True
+        assert load_settings(tmp_path).priority_order is None
+
+    def test_set_rejects_non_integer_entries(self, tmp_path: Path):
+        for bad in ("2,abc", "one", "2,-1", "0", "1,2.5"):
+            with pytest.raises(ConfigError, match="account numbers"):
+                set_setting(tmp_path, "autoswitch.priorityOrder", bad)
+        assert not settings_path(tmp_path).exists()
+
+    def test_set_rejects_empty(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="non-empty"):
+            set_setting(tmp_path, "autoswitch.priorityOrder", "  ")
+
+    def test_unknown_account_numbers_are_accepted(self, tmp_path: Path):
+        # Deliberate: settings.py has no switcher to ask, and accounts are
+        # added and removed after the setting is written. The engine ignores
+        # numbers that match nothing, exactly like autoswitch.model's names.
+        set_setting(tmp_path, "autoswitch.priorityOrder", "99,2")
+        assert load_settings(tmp_path).priority_order == "99,2"
+
+    def test_garbage_value_in_the_file_falls_back_to_the_default(
+        self, tmp_path: Path
+    ):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"priorityOrder": 12}})
+        )
+        assert load_settings(tmp_path).priority_order is None
+
+    def test_parse_splits_trims_and_dedupes(self):
+        assert parse_priority_order("2, 1 ,2,,3") == ("2", "1", "3")
+        assert parse_priority_order(None) == ()
+        assert parse_priority_order("") == ()
+        assert parse_priority_order("  ,  ") == ()
 
 
 class TestSaveSettings:

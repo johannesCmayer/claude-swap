@@ -7639,3 +7639,144 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+class TestSwitchingDisabled:
+    """`autoswitch.enabled = false`: the engine decides, reports, never switches."""
+
+    def _seed(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    # Active #1 over the 90% threshold, #2 nearly idle: a proactive switch.
+    FLEET = {"1": _usage(95), "2": _usage(10)}
+
+    def _disable(self, h: EngineHarness, value: str = "false") -> None:
+        from claude_swap.settings import set_setting
+
+        set_setting(h.switcher.backup_dir, "autoswitch.enabled", value)
+
+    def test_enabled_by_default_switches(self, temp_home):
+        h = self._seed(temp_home)
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_disabled_reports_the_switch_it_would_make(self, temp_home):
+        h = self._seed(temp_home)
+        self._disable(h)
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        no = [e for e in h.events if isinstance(e, NoSwitchEvent)][-1]
+        assert no.reason == "switching-disabled"
+        assert no.human() == (
+            "no switch: switching-disabled "
+            "(would switch Account-1 -> Account-2, proactive)"
+        )
+        # Nothing recorded as a switch: no cooldown, no departure bookkeeping.
+        assert "lastSwitchAt" not in h.engine._read_state()
+
+    def test_disabled_blocks_at_limit_too(self, temp_home):
+        h = self._seed(temp_home)
+        self._disable(h)
+        assert h.tick_with_usage({"1": _usage(100), "2": _usage(10)}) is (
+            TickOutcome.NO_ACTION
+        )
+        assert h.active_number() == 1
+
+    def test_disabled_blocks_dry_run_claims(self, temp_home):
+        h = self._seed(temp_home)
+        h.engine = h._make_engine(dry_run=True)
+        self._disable(h)
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.NO_ACTION
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+
+    def test_reread_per_switch_without_restart(self, temp_home):
+        h = self._seed(temp_home)
+        self._disable(h)
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.NO_ACTION
+        self._disable(h, "true")
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_manual_switch_is_not_blocked(self, temp_home):
+        h = self._seed(temp_home)
+        self._disable(h)
+        result = h.switcher.switch_to("2", json_output=True)
+        assert result and result.get("switched")
+        assert h.active_number() == 2
+
+    def test_bad_values_mean_enabled(self, temp_home):
+        from claude_swap.settings import load_autoswitch_enabled, settings_path
+
+        h = self._seed(temp_home)
+        path = settings_path(h.switcher.backup_dir)
+        for text in ("{not json", '{"autoswitch": []}', '{"autoswitch": {"enabled": "false"}}'):
+            path.write_text(text)
+            assert load_autoswitch_enabled(h.switcher.backup_dir) is True
+        path.write_text('{"autoswitch": {"enabled": false}}')
+        assert load_autoswitch_enabled(h.switcher.backup_dir) is False
+
+
+class TestDemandHeldByActive:
+    """Never-strands, refined: an ignored demand must not push the ONLY
+    account that can serve it off the machine proactively (2026-10-06 19:54:
+    `model demand Fable: ignored`, then `Switched Account-1 -> Account-2
+    (proactive)` onto an account with no Fable at all)."""
+
+    def _seed(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_incident_proactive_switch_is_withheld(self, temp_home):
+        # #1 has Fable but its 5h is over the threshold; #2 has no Fable. The
+        # demand is ignored (nobody serves it below the threshold) — before
+        # the fix this switched 1 -> 2 (proactive).
+        h = self._seed(temp_home)
+        _write_demand(h, ["Fable"])
+        outcome = h.tick_with_usage({"1": _model_usage(92, 50), "2": _usage(10)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.state for e in _demand_events(h)] == ["ignored"]
+        no = [e for e in h.events if isinstance(e, NoSwitchEvent)][-1]
+        assert no.reason == "demand-only-active"
+        assert "only Account-1 can serve Fable" in no.human()
+
+    def test_without_a_demand_the_proactive_switch_happens(self, temp_home):
+        # Negative control: same fleet, no demand file -> upstream behavior.
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({"1": _model_usage(92, 50), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_at_limit_still_escapes(self, temp_home):
+        # A spent active cannot run anything: the hold is for VOLUNTARY moves.
+        h = self._seed(temp_home)
+        _write_demand(h, ["Fable"])
+        outcome = h.tick_with_usage({"1": _model_usage(100, 50), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_another_server_releases_the_hold(self, temp_home):
+        # #2 also has Fable (over the threshold, but with headroom): the
+        # active is not the ONLY server, so the rule does not apply.
+        h = self._seed(temp_home)
+        h.seed(3, "c@example.com")
+        _write_demand(h, ["Fable"])
+        outcome = h.tick_with_usage({
+            "1": _model_usage(92, 50),
+            "2": _model_usage(95, 10),
+            "3": _usage(10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert not any(
+            isinstance(e, NoSwitchEvent) and e.reason == "demand-only-active"
+            for e in h.events
+        )

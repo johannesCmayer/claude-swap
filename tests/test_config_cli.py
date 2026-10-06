@@ -49,10 +49,11 @@ class TestConfigList:
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
+            "autoswitch.enabled",
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 10
+        assert out.count("(default)") == 11
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -79,7 +80,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 10
+        assert len(by_key) == 11
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
@@ -110,6 +111,22 @@ class TestConfigSetGet:
         assert "= false" in out
         raw = json.loads(_settings_file(capsys).read_text())
         assert raw["autoswitch"]["includeApiKeyAccounts"] is False
+
+    def test_set_autoswitch_enabled_false(self, temp_home, capsys):
+        from claude_swap.settings import load_autoswitch_enabled
+
+        path = _settings_file(capsys)
+        assert load_autoswitch_enabled(path.parent) is True  # no file
+        code, out, _ = _run(["set", "autoswitch.enabled", "false"], capsys)
+        assert code == 0
+        assert "autoswitch.enabled = false" in out
+        raw = json.loads(path.read_text())
+        assert raw["autoswitch"] == {"enabled": False}
+        assert load_autoswitch_enabled(path.parent) is False
+        code, out, _ = _run(["get", "autoswitch.enabled"], capsys)
+        assert out.strip() == "false"
+        _run(["set", "autoswitch.enabled", "true"], capsys)
+        assert load_autoswitch_enabled(path.parent) is True
 
     def test_set_preserves_unknown_keys(self, temp_home, capsys):
         path = _settings_file(capsys)

@@ -74,6 +74,7 @@ from claude_swap.poll_policy import (
 from claude_swap.settings import (
     AutoSwitchSettings,
     atomic_write_json,
+    load_autoswitch_enabled,
     parse_model_names,
     parse_priority_order,
 )
@@ -1300,6 +1301,27 @@ class AutoSwitchEngine:
             if settings.include_api_key_accounts
             else []
         )
+        if trigger in PROACTIVE_TRIGGERS and self._demand_held_by_active(
+            current, candidates, usage
+        ):
+            # The never-strands guard dropped the demand because the active
+            # account is over the threshold, and nobody else can serve the
+            # demanded model AT ALL. Deciding "as without a demand" would now
+            # move proactively onto an account that cannot run the demanded
+            # work, and the demander would switch straight back once the
+            # active recovered — the ping-pong of 2026-10-06 19:54. Hitting
+            # the active's limit later beats losing the model now, so a
+            # voluntary move waits; `at-limit` / `failover` still escape.
+            self._emit(
+                NoSwitchEvent(
+                    reason="demand-only-active",
+                    detail=(
+                        f"only Account-{current} can serve "
+                        f"{', '.join(self._demanded)}; holding it until its limit"
+                    ),
+                )
+            )
+            return TickOutcome.NO_ACTION
         if (
             trigger in BELOW_THRESHOLD_TRIGGERS
             and not oauth_candidates
@@ -2497,6 +2519,33 @@ class AutoSwitchEngine:
             self._poll_models = self._models
         return decision
 
+    def _demand_held_by_active(
+        self,
+        current: str,
+        candidates: Sequence[str],
+        usage: dict[str, dict | str | None],
+    ) -> bool:
+        """True when a model demand is in force but IGNORED this tick, the
+        active account can still serve every demanded model (any headroom on
+        its whole binding window, demanded windows included), and no
+        candidate can. Strict reading, as in ``_with_demanded_windows``: a
+        missing demanded window means "cannot serve", unknown usage means
+        "cannot be shown to serve". An APPLIED demand needs no such guard —
+        its strict values already make the model-less candidates exhausted.
+        """
+        if not self._demanded or self._demand_applied:
+            return False
+        merged = _merge_model_names(self._static_models, self._demanded)
+
+        def serves(num: str) -> bool:
+            value = _with_demanded_windows(usage.get(num), self._demanded)
+            h = oauth.account_headroom(
+                value if isinstance(value, dict) else None, merged
+            )
+            return h is not None and h > 0
+
+        return serves(current) and not any(serves(n) for n in candidates)
+
     def _announce_demand(self) -> None:
         """Event + log line when the demand state changed since the last
         announcement — once per change, never once per tick."""
@@ -2528,6 +2577,23 @@ class AutoSwitchEngine:
         trigger: str,
         left: tuple[float | None, float],
     ) -> TickOutcome:
+        # The ONE switch choke point, so `autoswitch.enabled` is read here and
+        # only here: polling, demand, cadence and plans above run unchanged,
+        # and the decision is still reported — as the switch it would have
+        # been. Re-read from the file per would-be switch (not from
+        # `self.settings`), so `cswap config set autoswitch.enabled false`
+        # reaches a running engine without a restart. Before the dry-run
+        # branch: a dry run of a disabled engine must not claim it would act.
+        if not load_autoswitch_enabled(self.switcher.backup_dir):
+            current = self.switcher.current_account_number()
+            src = f"Account-{current}" if current else "(none)"
+            self._emit(
+                NoSwitchEvent(
+                    reason="switching-disabled",
+                    detail=f"would switch {src} -> Account-{number}, {trigger}",
+                )
+            )
+            return TickOutcome.NO_ACTION
         if self.dry_run:
             current = self.switcher.current_account_number()
             current_email = self.switcher.account_email(current) if current else ""

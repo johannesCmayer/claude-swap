@@ -66,6 +66,13 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Master switch for SWITCHING only. False keeps `cswap auto` polling and
+    # deciding (it is also the usage poller other tools read), but every
+    # switch it would make is reported as `no switch: switching-disabled`
+    # instead. Re-read from the file at each switch (`load_autoswitch_enabled`),
+    # so a running engine follows `cswap config set` without a restart. A
+    # manual `cswap switch N` is never blocked by it.
+    enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -147,6 +154,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "enabled", "enabled", "bool",
+            help="Let cswap auto switch accounts (false: keep polling, never switch)",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -263,6 +274,20 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
     except TypeError:
         settings = AutoSwitchSettings()
     return _clamped(settings)
+
+
+def load_autoswitch_enabled(backup_root: Path) -> bool:
+    """``autoswitch.enabled`` straight from the file, nothing else.
+
+    The auto engine asks this at its switch choke point on every would-be
+    switch, so the key takes effect on a running engine. Only an explicit JSON
+    ``false`` disables: a missing/corrupt file, section or key, or a non-bool
+    value, is the default (enabled) — a bad hand edit must not silently stop
+    rotation."""
+    section = _read_raw(settings_path(backup_root)).get("autoswitch")
+    if not isinstance(section, dict):
+        return True
+    return section.get("enabled", True) is not False
 
 
 def load_ui_settings(backup_root: Path) -> UiSettings:

@@ -21,6 +21,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEngine,
     ConfigWarningEvent,
     ErrorEvent,
+    ModelDemandEvent,
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
@@ -28,7 +29,9 @@ from claude_swap.autoswitch import (
     TickOutcome,
     UnquarantineEvent,
     _recovery_is_useful,
+    _with_demanded_windows,
     pct_label,
+    read_model_demand,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
@@ -2761,6 +2764,375 @@ class TestModelAwareSwitch:
             "3": _model_usage(5, 10),
         })
         assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
+
+# --- runtime model demand ------------------------------------------------------
+
+
+def _write_demand(h: EngineHarness, models, *, ttl: float = 600.0) -> None:
+    h.engine.demand_path.write_text(
+        json.dumps({"models": models, "expiresAt": h.clock.now + ttl})
+    )
+
+
+def _demand_events(h: EngineHarness) -> list:
+    return [e for e in h.events if isinstance(e, ModelDemandEvent)]
+
+
+class TestReadModelDemand:
+    """The demand file is parsed defensively: every failure is "no demand"."""
+
+    NOW = 1_000_000.0
+
+    def _read(self, tmp_path: Path, text: str | None) -> tuple[str, ...]:
+        path = tmp_path / "model_demand.json"
+        if text is not None:
+            path.write_text(text)
+        return read_model_demand(path, self.NOW)
+
+    def test_missing_file_is_no_demand(self, tmp_path):
+        assert self._read(tmp_path, None) == ()
+
+    def test_valid_file(self, tmp_path):
+        text = json.dumps({"models": ["Fable"], "expiresAt": self.NOW + 600})
+        assert self._read(tmp_path, text) == ("Fable",)
+
+    def test_torn_file_is_no_demand(self, tmp_path):
+        # A reader racing a non-atomic writer sees a prefix.
+        assert self._read(tmp_path, '{"models": ["Fab') == ()
+        assert self._read(tmp_path, "") == ()
+
+    def test_unreadable_bytes_are_no_demand(self, tmp_path):
+        (tmp_path / "model_demand.json").write_bytes(b"\xff\xfe\x00garbage")
+        assert read_model_demand(tmp_path / "model_demand.json", self.NOW) == ()
+
+    def test_directory_in_place_of_file_is_no_demand(self, tmp_path):
+        (tmp_path / "model_demand.json").mkdir()
+        assert read_model_demand(tmp_path / "model_demand.json", self.NOW) == ()
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            ["Fable"],                                          # not an object
+            {"models": "Fable", "expiresAt": NOW + 600},        # not a list
+            {"models": ["Fable", 3], "expiresAt": NOW + 600},   # non-string
+            {"models": ["Fable"]},                              # no expiry
+            {"models": ["Fable"], "expiresAt": "soon"},
+            {"models": ["Fable"], "expiresAt": True},           # bool is int
+            {"models": ["Fable"], "expiresAt": None},
+        ],
+    )
+    def test_wrong_shape_is_no_demand(self, tmp_path, payload):
+        assert self._read(tmp_path, json.dumps(payload)) == ()
+
+    def test_non_finite_expiry_is_no_demand(self, tmp_path):
+        # Python's json accepts these literals; neither is a real deadline.
+        for literal in ("NaN", "Infinity"):
+            text = '{"models": ["Fable"], "expiresAt": %s}' % literal
+            assert self._read(tmp_path, text) == ()
+
+    def test_expired_is_no_demand(self, tmp_path):
+        for expires in (self.NOW, self.NOW - 1):
+            text = json.dumps({"models": ["Fable"], "expiresAt": expires})
+            assert self._read(tmp_path, text) == ()
+
+    def test_names_are_cleaned(self, tmp_path):
+        text = json.dumps({
+            "models": [" Fable ", "", "all", "fable", "Opus"],
+            "expiresAt": self.NOW + 1,
+        })
+        assert self._read(tmp_path, text) == ("Fable", "Opus")
+
+    def test_path_lives_next_to_the_state_file(self, temp_home):
+        from claude_swap.paths import get_backup_root, get_model_demand_path
+
+        with patch.dict(os.environ, {"XDG_DATA_HOME": ""}):
+            assert get_model_demand_path() == get_backup_root() / "model_demand.json"
+        h = EngineHarness(temp_home)
+        assert h.engine.demand_path == h.switcher.backup_dir / "model_demand.json"
+        assert h.engine.demand_path.parent == h.engine.state_path.parent
+
+
+class TestStrictDemandedWindows:
+    """A demanded model's MISSING window means the account cannot serve it."""
+
+    def test_missing_window_reads_as_exhausted(self):
+        value = _usage(5)  # 5h/7d readable, no scoped windows at all
+        strict = _with_demanded_windows(value, ("Fable",))
+        assert oauth.account_headroom(strict, ("Fable",)) == 0.0
+        # The lenient (static) reading of the same row: no constraint.
+        assert oauth.account_headroom(value, ("Fable",)) == 95.0
+        assert value == _usage(5)  # input untouched
+
+    def test_reported_window_is_used_as_is(self):
+        value = _model_usage(5, 40)
+        assert _with_demanded_windows(value, ("fable",)) is value
+        assert oauth.account_headroom(value, ("Fable",)) == 60.0
+
+    def test_only_the_missing_names_are_synthesized(self):
+        strict = _with_demanded_windows(_model_usage(5, 40), ("Fable", "Opus"))
+        assert [s["name"] for s in strict["scoped"]] == ["Fable", "Opus"]
+        assert oauth.account_headroom(strict, ("Fable", "Opus")) == 0.0
+
+    def test_unknown_usage_stays_unknown(self):
+        # "We know nothing" must not turn into "exhausted".
+        for value in (None, USAGE_TOKEN_EXPIRED, {}, {"spend": {"pct": 3.0}}):
+            assert _with_demanded_windows(value, ("Fable",)) is value
+
+
+class TestModelDemand:
+    """`model_demand.json`: strict, per-tick, and never stranding."""
+
+    def _seed(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    # Active #1 is a plan without Fable (no scoped window) and nearly idle;
+    # #2 has Fable and room; #3 has Fable but less room.
+    FLEET = {
+        "1": _usage(5),
+        "2": _model_usage(10, 20),
+        "3": _model_usage(10, 60),
+    }
+
+    def test_no_demand_file_holds_on_the_account_without_the_model(
+        self, temp_home
+    ):
+        h = self._seed(temp_home)
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert _demand_events(h) == []  # never mentioned without a file
+
+    def test_demand_switches_away_from_an_account_lacking_the_model(
+        self, temp_home
+    ):
+        h = self._seed(temp_home)
+        _write_demand(h, ["Fable"])
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.SWITCHED
+        assert h.active_number() == 2  # most headroom WITH Fable
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+        assert [(e.state, e.models) for e in _demand_events(h)] == [
+            ("applied", ["Fable"])
+        ]
+        # The poll line shows the window the decision read.
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.windows["1"]["Fable"] == 100.0
+        assert poll.headroom["1"] == 0.0
+
+    def test_demand_switch_is_not_held_by_the_cooldown(self, temp_home):
+        # At-limit semantics: an account that cannot do the demanded work at
+        # all is not held there by an anti-flap gate.
+        h = self._seed(temp_home)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock()))
+        _write_demand(h, ["Fable"])
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_dry_run_reports_the_demand_switch_without_switching(
+        self, temp_home
+    ):
+        h = self._seed(temp_home)
+        h.engine = h._make_engine(dry_run=True)
+        _write_demand(h, ["Fable"])
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.dry_run and switch.trigger == "at-limit"
+        assert switch.to_ref == {"number": 2, "email": "b@example.com"}
+
+    def test_expired_demand_is_no_demand(self, temp_home):
+        h = self._seed(temp_home)
+        _write_demand(h, ["Fable"], ttl=-1.0)
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert _demand_events(h) == []
+
+    def test_demand_is_reread_every_tick(self, temp_home):
+        # Written after construction AND after a first tick: no restart.
+        h = self._seed(temp_home)
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.NO_ACTION
+        _write_demand(h, ["Fable"])
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.SWITCHED
+
+    def test_demand_ending_does_not_switch_back_under_best(self, temp_home):
+        h = self._seed(temp_home)
+        _write_demand(h, ["Fable"], ttl=60.0)
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.make_live("b@example.com", 2)
+        h.clock.advance(3600.0)  # demand expired, cooldown long over
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons[-1] == "below-threshold"
+        assert [e.state for e in _demand_events(h)] == ["applied", "none"]
+
+    def test_announced_once_per_change_not_per_tick(self, temp_home):
+        h = self._seed(temp_home)
+        _write_demand(h, ["Fable"])
+        h.tick_with_usage(self.FLEET)
+        h.make_live("b@example.com", 2)
+        h.clock.advance(60.0)
+        _write_demand(h, ["Fable"])
+        h.tick_with_usage(self.FLEET)
+        h.tick_with_usage(self.FLEET)
+        assert [e.state for e in _demand_events(h)] == ["applied"]
+        # A different demanded set IS a change.
+        _write_demand(h, ["Fable", "Opus"])
+        h.tick_with_usage(self.FLEET)
+        assert [(e.state, e.models) for e in _demand_events(h)][-1] == (
+            "ignored", ["Fable", "Opus"]  # nobody reports Opus
+        )
+
+    def test_demand_nobody_can_serve_is_ignored(self, temp_home):
+        # Fable spent everywhere it exists: applying the demand would read
+        # the whole fleet as exhausted. Decide as without it instead.
+        h = self._seed(temp_home)
+        _write_demand(h, ["Fable"])
+        outcome = h.tick_with_usage({
+            "1": _usage(5),
+            "2": _model_usage(10, 95),   # at/over the 90% threshold
+            "3": _model_usage(10, 100),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+        assert [e.state for e in _demand_events(h)] == ["ignored"]
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_serving_needs_the_whole_binding_window(self, temp_home):
+        # #2 has Fable room but a spent 5-hour window: it cannot take the
+        # work either, so the demand is still unservable.
+        h = self._seed(temp_home)
+        _write_demand(h, ["Fable"])
+        outcome = h.tick_with_usage({
+            "1": _usage(5),
+            "2": _model_usage(100, 10),
+            "3": _usage(5),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.state for e in _demand_events(h)] == ["ignored"]
+
+    def test_ignored_demand_decides_exactly_as_without_it(self, temp_home):
+        # Active #1 HAS Fable, at 95%: under an applied (or leniently folded)
+        # demand it would be over the threshold and move. Nobody else has
+        # Fable, so the demand is ignored — and with it the Fable axis.
+        h = self._seed(temp_home)
+        _write_demand(h, ["Fable"])
+        outcome = h.tick_with_usage({
+            "1": _model_usage(5, 95),
+            "2": _usage(5),
+            "3": _usage(5),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.state for e in _demand_events(h)] == ["ignored"]
+
+    def test_the_active_account_counts_as_a_server(self, temp_home):
+        # Only the ACTIVE can serve Fable: the demand applies, and since the
+        # active is the one fine account there is nothing to do.
+        h = self._seed(temp_home)
+        _write_demand(h, ["Fable"])
+        outcome = h.tick_with_usage({
+            "1": _model_usage(5, 20),
+            "2": _usage(5),
+            "3": _usage(5),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.state for e in _demand_events(h)] == ["applied"]
+
+    def test_unknown_active_usage_stays_unknown(self, temp_home):
+        h = self._seed(temp_home)
+        _write_demand(h, ["Fable"])
+        outcome = h.tick_with_usage({
+            "1": None,
+            "2": _model_usage(10, 20),
+            "3": _model_usage(10, 60),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["active-usage-unknown"]
+
+    def test_static_model_setting_stays_lenient(self, temp_home):
+        # Upstream semantics: `autoswitch.model` treats a missing window as no
+        # constraint, so the account without Fable is still fine.
+        h = self._seed(temp_home, model="Fable")
+        assert h.tick_with_usage(self.FLEET) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_static_and_demanded_axes_combine(self, temp_home):
+        # Static Opus (lenient) + demanded Fable (strict): #2 has Fable room
+        # but Opus is spent there, so #3 is the account that serves both.
+        h = self._seed(temp_home, model="Opus")
+        _write_demand(h, ["Fable"])
+
+        def usage(five_h, fable, opus):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {"pct": 0.0},
+                "scoped": [
+                    {"name": "Fable", "pct": fable},
+                    {"name": "Opus", "pct": opus},
+                ],
+            }
+
+        outcome = h.tick_with_usage({
+            "1": _usage(5),
+            "2": usage(5, 10, 100),
+            "3": usage(5, 40, 30),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_static_axes_stay_lenient_under_a_demand(self, temp_home):
+        # Static Opus is lenient even while a Fable demand is strict: #2
+        # reports no Opus window, which is NOT "cannot serve Opus", so it
+        # serves the demand and the engine moves there.
+        h = self._seed(temp_home, model="Opus")
+        _write_demand(h, ["Fable"])
+        outcome = h.tick_with_usage({
+            "1": _usage(5),
+            "2": _model_usage(5, 10),   # Fable, no Opus window
+            "3": _usage(5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_poll_policy_inputs_follow_the_effective_axes(self, temp_home):
+        h = self._seed(temp_home, model="Opus")
+        override = lambda: h.switcher._poll_inputs_override  # noqa: E731
+        assert override() == (90.0, ("Opus",))
+        h.engine = h._make_engine(dry_run=True)
+        _write_demand(h, ["Fable"])
+        h.tick_with_usage(self.FLEET)
+        assert override() == (90.0, ("Opus", "Fable"))
+        # Unservable demand: ignored, so cadence keys on the static axes.
+        h.tick_with_usage({"1": _usage(5), "2": _usage(5), "3": _usage(5)})
+        assert override() == (90.0, ("Opus",))
+        h.tick_with_usage(self.FLEET)
+        assert override() == (90.0, ("Opus", "Fable"))
+        h.engine.demand_path.unlink()
+        h.tick_with_usage(self.FLEET)
+        assert override() == (90.0, ("Opus",))
+
+    def test_event_json_shape(self):
+        event = ModelDemandEvent(state="applied", models=["Fable"])
+        payload = event.to_json()
+        assert payload["event"] == "model-demand"
+        assert payload["state"] == "applied"
+        assert payload["models"] == ["Fable"]
+        assert "applied" in event.human()
+        assert "ignored" in ModelDemandEvent(
+            state="ignored", models=["Fable"]
+        ).human()
 
 
 # --- consume-first strategy ----------------------------------------------------

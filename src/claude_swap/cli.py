@@ -596,8 +596,13 @@ Examples:
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
+  cswap auto --once --dry-run      # one decision, including any model demand
 
 Defaults live in settings.json in the backup root; flags override them.
+While model_demand.json in the backup root holds an unexpired
+{"models": ["Fable"], "expiresAt": <epoch seconds>}, accounts that report no
+window for a demanded model count as exhausted (a "model demand" line says
+whether the demand is applied or ignored).
         """,
     )
     parser.add_argument(

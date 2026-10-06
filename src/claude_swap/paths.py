@@ -30,6 +30,10 @@ from claude_swap.models import Platform
 
 LEGACY_BACKUP_DIRNAME = ".claude-swap-backup"
 
+# Runtime model demand, written by an external program that knows which
+# models live sessions need (see ``autoswitch.read_model_demand``).
+MODEL_DEMAND_FILENAME = "model_demand.json"
+
 
 def get_claude_config_home() -> Path:
     """Return the Claude config home directory (CLAUDE_CONFIG_DIR or ~/.claude)."""
@@ -106,6 +110,17 @@ def get_backup_root() -> Path:
                 return xdg_path / "claude-swap"
         return Path.home() / ".local" / "share" / "claude-swap"
     return get_legacy_backup_root()
+
+
+def get_model_demand_path() -> Path:
+    """Return the model-demand file the auto engine re-reads every tick.
+
+    ``<backup_root>/model_demand.json``, next to ``autoswitch_state.json``:
+    ``{"models": ["Fable"], "expiresAt": <epoch seconds>}``. Written by an
+    external program while sessions that need those models are live; the
+    engine never writes it.
+    """
+    return get_backup_root() / MODEL_DEMAND_FILENAME
 
 
 # Names that any prior cswap run may have created in the backup root without

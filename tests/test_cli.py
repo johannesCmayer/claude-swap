@@ -1003,6 +1003,7 @@ class TestAutoCommand:
         out = capsys.readouterr().out
         assert "--once" in out
         assert "Exit codes" in out
+        assert "model_demand.json" in out
 
     def test_main_help_mentions_auto(self):
         result = subprocess.run(

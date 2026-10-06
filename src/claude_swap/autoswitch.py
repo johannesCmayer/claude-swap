@@ -29,6 +29,18 @@ every five hours, unspent. So ``priority`` burns the accounts named in
 ``settings.priority_order`` first and *returns* to them the moment they are
 comfortably healthy again, leaving the unlisted (big) accounts as the reserve.
 
+Model demand is the runtime counterpart of ``settings.model``. An external
+program that knows a session needs a model (say Fable) keeps
+``<backup_root>/model_demand.json`` alive while it does, and the engine
+re-reads it every tick. Demanded models are STRICT where the static setting
+is lenient: an account whose readable usage carries no window for a demanded
+model cannot serve it, so it counts as exhausted for the decision (a Pro plan
+has no Fable window at all, and the lenient reading treats that as "no
+constraint"). The static setting keeps its lenient meaning for upstream
+compatibility. Demand narrows, never strands: when no account can serve every
+demanded model below the threshold, the tick ignores the demand and decides
+exactly as without it.
+
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
 read-modify-write under a dedicated file lock.
@@ -53,6 +65,7 @@ from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
+from claude_swap.paths import MODEL_DEMAND_FILENAME
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
@@ -325,6 +338,94 @@ def pct_label(value: float) -> str:
     return f"{value:.10g}"
 
 
+def read_model_demand(path: Path, now: float) -> tuple[str, ...]:
+    """Model names demanded by ``model_demand.json``, or ``()`` for none.
+
+    The file is ``{"models": ["Fable"], "expiresAt": <epoch seconds>}``,
+    refreshed by its writer while the demand lasts and deleted when it ends.
+    The expiry is what makes a crashed writer harmless: a file nobody
+    refreshes stops counting on its own.
+
+    Never raises, and every failure means "no demand": a missing file, a torn
+    or unparseable one (the writer replaces it while we read), a wrong shape
+    (any non-string model entry rejects the whole file rather than guessing
+    which half to believe), or ``expiresAt <= now``. Blank names and the
+    ``all`` sentinel are dropped — strictness is a claim about one NAMED
+    window, and ``all`` names none. Names are deduplicated case-insensitively,
+    first spelling kept, the same matching ``oauth.relevant_windows`` uses.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ()
+    if not isinstance(raw, dict):
+        return ()
+    expires_at = raw.get("expiresAt")
+    if (
+        isinstance(expires_at, bool)
+        or not isinstance(expires_at, (int, float))
+        or not math.isfinite(expires_at)
+        or expires_at <= now
+    ):
+        return ()
+    models = raw.get("models")
+    if not isinstance(models, list) or not all(isinstance(m, str) for m in models):
+        return ()
+    names: list[str] = []
+    seen: set[str] = set()
+    for model in models:
+        name = model.strip()
+        if not name or name.lower() == "all" or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        names.append(name)
+    return tuple(names)
+
+
+def _merge_model_names(
+    static: tuple[str, ...], demanded: tuple[str, ...]
+) -> tuple[str, ...]:
+    """``static`` followed by every demanded name it does not already list
+    (case-insensitively), so the decision reads each window once."""
+    have = {m.lower() for m in static}
+    return static + tuple(m for m in demanded if m.lower() not in have)
+
+
+def _with_demanded_windows(
+    value: dict | str | None, demanded: tuple[str, ...]
+) -> dict | str | None:
+    """One decision value with STRICT demand semantics applied.
+
+    Every demanded model the account reports no window for gets a synthetic
+    ``{"name": model, "pct": 100.0}`` scoped window: the account cannot
+    serve that model, so for the decision it is exhausted on it. Injected
+    into the usage itself rather than special-cased in the headroom math, so
+    every reader downstream — headroom, ranking, recovery ordering, the poll
+    event's window list — sees one consistent account. No ``resets_at``: an
+    account without the model never gets it back, so its recovery sorts last
+    (``inf``) like any other unknown reset.
+
+    Only usage that is otherwise READABLE is touched. A sentinel string or
+    ``None`` stays what it is, and so does a dict with no 5h/7d window at all
+    — otherwise "we know nothing about this account" would turn into "this
+    account is exhausted", and the failover/unknown paths would never see it.
+    """
+    if not isinstance(value, dict) or not oauth.relevant_windows(value):
+        return value
+    served = {label.lower() for label, _, _ in oauth.relevant_windows(value, demanded)}
+    missing = [m for m in demanded if m.lower() not in served]
+    if not missing:
+        return value
+    scoped = value.get("scoped")
+    return {
+        **value,
+        "scoped": [
+            *(scoped if isinstance(scoped, list) else []),
+            *({"name": m, "pct": 100.0} for m in missing),
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
@@ -545,6 +646,37 @@ class ConfigWarningEvent(AutoSwitchEvent):
         return f"warning: {self.message}"
 
 
+@dataclass(frozen=True)
+class ModelDemandEvent(AutoSwitchEvent):
+    """The runtime model demand changed state. Emitted on CHANGE only (and
+    so never by an engine that has not seen a demand file): ``applied`` —
+    accounts lacking a demanded model's window count as exhausted;
+    ``ignored`` — no account can serve every demanded model below the
+    threshold, so this tick decides as if there were no demand; ``none`` —
+    the demand expired or was withdrawn."""
+
+    kind: ClassVar[str] = "model-demand"
+    state: str  # "applied" | "ignored" | "none"
+    models: list[str] = field(default_factory=list)
+
+    def _fields(self) -> dict:
+        return {"state": self.state, "models": self.models}
+
+    def human(self) -> str:
+        names = ", ".join(self.models)
+        if self.state == "applied":
+            return (
+                f"model demand {names}: applied (accounts without a "
+                f"{names} window count as exhausted)"
+            )
+        if self.state == "ignored":
+            return (
+                f"model demand {names}: ignored (no account can serve it "
+                "below the threshold; deciding without it)"
+            )
+        return "model demand: none"
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -576,6 +708,8 @@ def _window_pcts(
     ``models`` filter): showing an unconfigured scoped window at 100% next
     to a switch onto that account would look like a bug, when the engine
     correctly ignored it. Full per-model usage lives in ``cswap list``.
+    While a model demand is applied, an account lacking the demanded window
+    shows it at 100% — the synthetic value the decision reads.
     """
     return {
         name: pct for name, pct, _ in oauth.relevant_windows(usage, models)
@@ -700,23 +834,41 @@ class AutoSwitchEngine:
         *,
         dry_run: bool = False,
         state_path: Path | None = None,
+        demand_path: Path | None = None,
         clock: Callable[[], float] = time.time,
     ):
         self.switcher = switcher
         self.settings = settings
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
-        # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
-        # pass everywhere usage windows are read — decisions, cadence, and
-        # reset scheduling must all see the same axes.
-        self._models = parse_model_names(settings.model)
+        # separated list ("Fable", "Opus,Sonnet", "all"), parsed once here:
+        # the STATIC, lenient axes.
+        self._static_models = parse_model_names(settings.model)
+        # The axes THIS tick decides on: the static ones, plus any demanded
+        # model while the demand is applied (`_resolve_demand`). Re-derived
+        # every tick and passed everywhere usage windows are read —
+        # decisions, cadence, and reset scheduling must all see the same axes.
+        self._models = self._static_models
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
-        # whatever the settings file happens to say.
+        # whatever the settings file happens to say. Re-pinned whenever the
+        # effective set changes; `_poll_models` is what was last pinned.
         switcher.set_poll_policy_inputs(settings.threshold, self._models)
+        self._poll_models = self._models
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
+        self.demand_path = demand_path or (
+            switcher.backup_dir / MODEL_DEMAND_FILENAME
+        )
+        # Per tick: the demanded names read from `demand_path`, and whether
+        # the never-strands guard let them into the decision.
+        self._demanded: tuple[str, ...] = ()
+        self._demand_applied = False
+        # Last announced (state, names), so the event and log line fire once
+        # per change rather than every tick. Starts at "none": an engine that
+        # never sees a demand file never says anything about one.
+        self._demand_announced: tuple[str, tuple[str, ...]] = ("none", ())
         self.clock = clock
         self._stop = threading.Event()
         # Cuts the current inter-tick sleep short (a session threshold change
@@ -737,7 +889,9 @@ class AutoSwitchEngine:
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
-        self._model_check_done = not self._models
+        # Static names only: a demanded name comes from a program, not a
+        # human typing a config value.
+        self._model_check_done = not self._static_models
 
     # -- state file ---------------------------------------------------------
 
@@ -991,6 +1145,7 @@ class AutoSwitchEngine:
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
+        self._announce_demand()
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1012,6 +1167,9 @@ class AutoSwitchEngine:
         )
 
         if not self._model_check_done:
+            # A synthetic demanded window cannot fake a match here: one only
+            # exists while the demand is applied, which needs some account
+            # really reporting every demanded name.
             self._check_model_names(quarantined, usage)
 
         if (
@@ -1064,6 +1222,13 @@ class AutoSwitchEngine:
                 # on the trigger rather than on the strategy.
                 trigger = settings.strategy
             else:
+                # An active account that cannot serve an APPLIED demanded
+                # model lands here as at-limit (its synthetic window reads
+                # 100%), and that is the right escape: it cannot do the
+                # demanded work at all, exactly like a hard limit, so the
+                # cooldown and the no-return bar do not hold it there. The
+                # never-strands guard is what keeps this from firing when no
+                # account could do better.
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
@@ -1275,7 +1440,15 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch={current, *candidates}
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            # Demand is re-resolved on the fresh rows too: whether anyone can
+            # serve the demanded model is exactly the kind of claim a refetch
+            # can refute.
+            usage = self._resolve_demand(
+                {num: entry.decision_value() for num, entry in entries.items()},
+                [current, *candidates],
+                settings.threshold,
+            )
+            self._announce_demand()
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
@@ -2147,6 +2320,11 @@ class AutoSwitchEngine:
         decision values and ``headroom`` the derived headroom per account.
         """
         now = self.clock()
+        # The model demand is re-read every tick, here, on the same `now` the
+        # collection schedules by: one small file, and its expiry is only
+        # honoured if somebody looks. Applied (or not) once usage is in hand —
+        # see `_resolve_demand`.
+        self._demanded = read_model_demand(self.demand_path, now)
         # Quarantined accounts can never be switch targets, so spending the
         # single alternate poll slot (or an escalation fetch) on one is wasted.
         candidates = [
@@ -2204,16 +2382,24 @@ class AutoSwitchEngine:
             # nomination preserves a valid future plan under the store lock.
             scheduled=not stale_candidate_plan,
         )
-        usage = {num: entry.decision_value() for num, entry in entries.items()}
+        # The caller's tick-snapshotted threshold, so one tick fetches and
+        # decides on the same value even if apply_threshold() lands mid-tick.
+        if threshold is None:
+            threshold = self.settings.threshold
+        # Demand is resolved BEFORE the escalation test, so an active account
+        # that cannot serve a demanded model reads as at its limit here too —
+        # and the candidates it is about to be compared against get fetched
+        # fresh rather than served from a row up to ten minutes old.
+        usage = self._resolve_demand(
+            {num: entry.decision_value() for num, entry in entries.items()},
+            [current, *candidates],
+            threshold,
+        )
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
             active_value if isinstance(active_value, dict) else None, self._models
         )
-        # The caller's tick-snapshotted threshold, so one tick fetches and
-        # decides on the same value even if apply_threshold() lands mid-tick.
-        if threshold is None:
-            threshold = self.settings.threshold
         escalate = bool(candidates) and (
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
@@ -2246,10 +2432,94 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch=escalation_fetch
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = self._resolve_demand(
+                {num: entry.decision_value() for num, entry in entries.items()},
+                [current, *candidates],
+                threshold,
+            )
 
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
+
+    def _resolve_demand(
+        self,
+        raw: dict[str, dict | str | None],
+        accounts: Sequence[str],
+        threshold: float,
+    ) -> dict[str, dict | str | None]:
+        """Apply this tick's model demand to raw decision values.
+
+        Sets ``self._models`` (the axes the rest of the tick reads) and
+        returns the values the decision should use. Re-run on every fresh set
+        of rows within a tick, since each refetch can change the answer.
+
+        DEMAND NARROWS, NEVER STRANDS. With the demand applied, an account
+        lacking a demanded model's window is exhausted (see
+        ``_with_demanded_windows``). If that leaves NO account in
+        ``accounts`` (the active one included) under the threshold with every
+        demanded model, the demand is dropped for the tick and the raw values
+        and static axes come back untouched — exactly the decision the engine
+        would make without a demand file. Without this, a fleet whose demanded
+        model is spent everywhere would read as all-exhausted, and the
+        recovery ranking would move it onto whichever account's model window
+        resets soonest, trading everyone's general quota for a model nobody
+        can use yet.
+
+        "Serve" means the account's whole binding window, not just the
+        demanded one: an account with Fable room but a spent 5-hour window
+        cannot take the work either.
+
+        Poll planning is re-pinned to the new axes when they change, so the
+        cadence follows the decision (the scoped window that binds a decision
+        must not be invisible to the scheduler).
+        """
+        demanded = self._demanded
+        merged = _merge_model_names(self._static_models, demanded)
+        decision = raw
+        applied = False
+        if demanded:
+            strict = {
+                num: _with_demanded_windows(value, demanded)
+                for num, value in raw.items()
+            }
+            for num in accounts:
+                value = strict.get(num)
+                h = oauth.account_headroom(
+                    value if isinstance(value, dict) else None, merged
+                )
+                if h is not None and 100.0 - h < threshold:
+                    decision, applied = strict, True
+                    break
+        self._demand_applied = applied
+        self._models = merged if applied else self._static_models
+        if self._models != self._poll_models:
+            self.switcher.set_poll_policy_inputs(threshold, self._models)
+            self._poll_models = self._models
+        return decision
+
+    def _announce_demand(self) -> None:
+        """Event + log line when the demand state changed since the last
+        announcement — once per change, never once per tick."""
+        if not self._demanded:
+            state = "none"
+        else:
+            state = "applied" if self._demand_applied else "ignored"
+        key = (state, self._demanded)
+        if key == self._demand_announced:
+            return
+        self._demand_announced = key
+        names = ", ".join(self._demanded)
+        if state == "applied":
+            _logger.info("Model demand %s applied", names)
+        elif state == "ignored":
+            _logger.info(
+                "Model demand %s ignored: no account can serve it below the "
+                "threshold",
+                names,
+            )
+        else:
+            _logger.info("Model demand ended")
+        self._emit(ModelDemandEvent(state=state, models=list(self._demanded)))
 
     def _perform(
         self,
@@ -2346,7 +2616,7 @@ class AutoSwitchEngine:
         polling legitimately leaves gaps before that — and never worth a
         forced refresh of its own.
         """
-        wanted = {m.lower(): m for m in self._models if m.lower() != "all"}
+        wanted = {m.lower(): m for m in self._static_models if m.lower() != "all"}
         if not wanted:
             self._model_check_done = True  # bare "all" needs no name match
             return
@@ -2433,11 +2703,13 @@ class AutoSwitchEngine:
 
     def apply_threshold(self, threshold: float) -> None:
         """Session override from the TUI: retarget the trigger and poll
-        cadence mid-run. Threshold only — the model axes (and their derived
-        state) are fixed at construction. The frozen-settings swap is atomic
-        and each tick snapshots ``self.settings`` once, so no locking."""
+        cadence mid-run. Threshold only — the static model axes are fixed at
+        construction (the demanded ones follow the demand file, per tick).
+        The frozen-settings swap is atomic and each tick snapshots
+        ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
         self.switcher.set_poll_policy_inputs(threshold, self._models)
+        self._poll_models = self._models
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
